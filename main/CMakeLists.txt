@@ -1,0 +1,12 @@
+idf_component_register(SRCS   "slave_client.c" 
+                              "slave_server.c" 
+                              "main.c"
+                              "icm20948.c"
+                              "measurement.c"
+                              "circ_buffer.c"
+                              "espnow_manager.c"
+                              "wifi_manager.c"
+                              "slave_server.c"
+                              "slave_client.c"
+                       INCLUDE_DIRS "."
+                       REQUIRES esp_wifi nvs_flash esp_event driver esp_timer fatfs sdmmc vfs)

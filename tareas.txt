@@ -1,0 +1,44 @@
+1. wifi_manager — adaptaciones
+
+wifi_base_init(): el esclavo debe inicializar como STA (no AP oculto), conectarse al AP del master
+Agregar logica de reconexion automatica en el esclavo si cae la conexion WiFi
+
+
+2. Nuevo modulo slave_server (en el master)
+
+Servidor TCP que escucha en un puerto dedicado (distinto al de la PC)
+Acepta hasta 4 conexiones simultaneas de esclavos
+Al conectar, el esclavo envia su MAC (handshake de identificacion)
+Asocia el socket al node_state_t correspondiente en g_nodes[]
+Una slave_rx_task por esclavo conectado
+Maneja desconexion y limpia el slot correspondiente
+
+
+3. Nuevo modulo slave_client (en el esclavo)
+
+Cliente TCP que conecta al master AP
+Reconexion automatica con backoff
+Envia MAC al conectar (handshake)
+Modo grabacion: al finalizar tx_task, envia la measurement_t completa por TCP
+Modo stream: envia chunks del circ_buffer en tiempo real por TCP
+
+
+4. main.c — adaptaciones
+
+Master: inicializar slave_server despues de wifi_manager_init
+Esclavo: inicializar slave_client despues de wifi_base_init
+tx_task esclavo: reemplazar espnow_send_stream_data() → slave_client_send_stream_chunk()
+tx_task esclavo: reemplazar envio fragmentado ESP-NOW → slave_client_send_measurement()
+Master: on_wifi_get_data nuevo → lee datos del slot local recibido por TCP
+Master: stream → reenvia chunks recibidos por TCP del esclavo al socket de la PC
+
+
+5. protocol.h — extensiones
+
+Definir el protocolo de handshake TCP esclavo↔master
+Definir header de paquete binario para modo grabacion y stream
+
+
+6. CMakeLists.txt
+
+Agregar slave_server.c y slave_client.c

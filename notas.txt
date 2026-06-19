@@ -1,0 +1,765 @@
+vTaskDelay(pdMS_TO_TICKS(5));
+```
+
+5ms de pausa entre fragmentos. ESP-NOW tiene un buffer interno limitado. Si envias 11 paquetes sin pausa el driver los encola internamente y si la cola se llena descarta los nuevos. Con 5ms entre cada uno el driver tiene tiempo de transmitir antes del siguiente.
+
+---
+
+## Como lo rearma el master
+
+En `on_espnow_data_response`, el master hace exactamente lo inverso:
+```
+Fragmento 0  →  memcpy(buf + 0,    payload, 200)
+Fragmento 1  →  memcpy(buf + 200,  payload, 200)
+Fragmento 2  →  memcpy(buf + 400,  payload, 200)
+...
+Fragmento 10 →  memcpy(buf + 2000, payload, 58)
+
+Cuando s_reassembly_received == frag_total:
+    buf contiene los 2058 bytes originales en orden correcto
+    → send() a la PC
+```
+
+---
+
+## Visualmente
+```
+Medicion en PSRAM del esclavo (2058 bytes):
+┌──────────────────────────────────────────────────────┐
+│  header (30)  │  samples (2028 bytes)                │
+|──────────────────────────────────────────────────────┘
+
+Se parte en 11 fragmentos de ESP-NOW:
+┌────────┐ ┌────────┐ ┌────────┐     ┌──────┐
+│ 200 B  │ │ 200 B  │ │ 200 B  │ ... │ 58 B │
+│ frag 0 │ │ frag 1 │ │ frag 2 │     │frag10│
+|────────┘ |────────┘ |────────┘     |──────┘
+
+El master los rearma en orden y envia el bloque completo a la PC.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Como funciona el xEventGroupSetBits 
+
+Un EventGroup es un entero de 32 bits donde cada bit es una flag independiente:
+
+xEventGroupSetBits pone el bit 1 en 1:
+
+antes:  0b00000000
+despues: 0b00000010
+
+¿Despierta de inmediato? — Casi. Lo que pasa exactamente es:
+
+xEventGroupSetBits(TRIGGER)
+    │
+    │→ FreeRTOS marca la task como "lista para correr"
+    │→ El scheduler compara prioridades:
+            task1 (prio 2) > task2 (prio 1)
+            → task1  sigue corriendo hasta que se bloquee (vTaskDelay)
+            → recien ahi task2 toma el CPU
+Y task2 espera asi:
+
+EventBits_t bits = xEventGroupWaitBits(
+    eventos,
+    EVT_1 | EVT_2,                  // espera cualquiera de los dos
+    pdTRUE,                        // limpia el bit al despertar (auto-clear)
+    pdFALSE,                       // basta con que UNO este seteado (OR, no AND)
+    pdMS_TO_TICKS(100)             // timeout: si en 100ms no llega nada, sigue igual
+);
+El pdTRUE es importante — el bit se borra solo al despertar, asi no queda "pegado" para la proxima iteracion.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## El esclavo detecta la vibracion
+
+Fase 1 — Llenado continuo del buffer
+sensor_task (Core 1, prio 5) — cada 50ms:
+  icm20948_read_fifo(&g_sensor, s_fifo_buf, &n)
+      |→ circ_buffer_push(&g_buffer, s_fifo_buf, n)
+              g_buffer_frozen == false → escribe normalmente
+              Si buffer lleno (900): overwrite de muestras viejas
+
+Fase 2 — Vigilante detecta vibracion
+vigilante_task (Core 1, prio 4) — cada 100ms, solo si status==IDLE:
+  circ_buffer_peek_last(&g_buffer, s_vigilante_buf, 22) → solo mira las ultimas 22 muestras para detectar vibracion
+      |→ calcula RMS vectorial (√(x²+y²+z²)/n)
+          RMS > threshold (1.5g) && cooldown OK (2000ms)?
+              g_role == SLAVE:
+                  espnow_send_trigger_notify(g_master_mac, rms, now_ms())
+                      |→ paquete ESP-NOW MSG_TRIGGER_NOTIFY → master (aviso al amster)
+
+Fase 3 — Master recibe la notificacion
+espnow_rx_task (dentro de espnow_manager):
+  recibe MSG_TRIGGER_NOTIFY
+      |→ on_espnow_trigger_notify(msg):
+              g_trigger_slot   = g_current_slot
+              g_trigger_ts     = now_ms()
+              g_buffer_frozen  = true   ← congela su propio buffer
+              g_post_count     = 0
+              g_post_active    = true
+              espnow_send_trigger(BROADCAST, slot, AUTO, ts)
+                  |→ paquete ESP-NOW MSG_TRIGGER → todos los nodos
+              wifi_manager_send_event("EVENT TRIGGER MAC=... RMS=...")
+                  |→ notifica a la PC por TCP/5000
+              xEventGroupSetBits(g_eventos, EVT_TRIGGER)
+                  |→ despierta tx_task del MASTER
+
+Fase 4 — Esclavo recibe el broadcast
+espnow_rx_task (en el esclavo):
+  recibe MSG_TRIGGER
+      |→ on_espnow_trigger(msg):
+              g_trigger_slot   = msg->slot_index
+              g_trigger_ts     = msg->timestamp_ms  ← timestamp del MASTER
+              g_buffer_frozen  = true   ← congela su propio buffer
+              g_post_count     = 0
+              g_post_active    = true
+              espnow_send_trigger_ack(g_master_mac, slot, now_ms())
+                  |→ master recibe ACK → on_espnow_trigger_ack:
+                          g_nodes[idx].status = RECORDING
+                          desfase = ack.ts - g_trigger_ts  (latencia)
+              xEventGroupSetBits(g_eventos, EVT_TRIGGER)
+                  |→ despierta tx_task del ESCLAVO
+
+Fase 5 — tx_task graba (ocurre en MASTER y ESCLAVO en paralelo)
+tx_task (Core 0, prio 3):
+  xEventGroupWaitBits(g_eventos, EVT_TRIGGER|EVT_VIBRACION)
+      |→ bit set → despierta
+
+  g_status = NODE_STATUS_RECORDING
+
+  measurement_alloc(pre=112 + post=225)
+      |→ heap_caps_malloc en PSRAM  → measurement_t *m
+
+  // Llena el header de la medicion
+  memcpy(m->node_mac, g_own_mac, 6)
+  m->slot_index     = g_trigger_slot
+  m->timestamp_ms   = g_trigger_ts
+  m->num_samples    = 337
+  m->pre_samples    = 112
+  ...
+
+  // Extrae el PRE-trigger del buffer congelado
+  circ_buffer_pop(&g_buffer, samples_ptr, pre=112)
+      |→ saca las 112 muestras mas antiguas (500ms antes del golpe)
+         tail avanza 112 posiciones, count baja 112
+
+  // Espera que sensor_task llene el post-trigger
+  while (g_post_count < 225):
+      EVT_STOP? → cancela
+      timeout?  → sale igual
+      vTaskDelay(10ms)
+      (sensor_task escribe en g_post_buf durante esta espera)
+
+  // Copia el POST-trigger
+  memcpy(samples_ptr + pre_got, g_post_buf, post_got * sizeof(sample))
+
+  // Libera el sistema de captura
+  g_post_active   = false
+  g_buffer_frozen = false   ← sensor_task vuelve a escribir en g_buffer
+  g_post_count    = 0
+
+  // Guarda la medicion
+  g_slots[g_trigger_slot] = m        ← PSRAM, acceso futuro
+  sd_save_measurement(m)             ← escribe .bin en SD
+
+  // Esclavo con auto_sync activo: envia al master → NO FUNCIONA, VER
+  slave_client_send_measurement(m)
+      |→ TCP/5001 → slave_server → on_slave_measurement:
+              wifi_manager_send_raw(buf, total)
+                  |→ binario MEAS_PKT_DATA → PC por TCP/5000
+
+  g_current_slot = (slot + 1) % 5
+  measurement_to_summary(m)  → calcula RMS y PEAK → log
+  g_status = NODE_STATUS_IDLE
+
+
+         ESCLAVO                               MASTER                    PC
+            │                                    │                       │
+sensor_task │─push→ g_buffer                     │─push → g_buffer       │
+            │                                    │                       │
+vigilante   │─peek_last→ RMS>1.5g                │                       │
+            │─espnow_send_trigger_notify─────── →│                       │
+            │                          on_espnow_trigger_notify          │
+            │                          congela master                    │
+            │                          ←─espnow_send_trigger(BROADCAST)─ │
+on_espnow   │                                    │                       │
+_trigger    │ congela esclavo                    │─send_event─────────── →"EVENT TRIGGER"
+            │─espnow_send_trigger_ack────────── →│                       │
+            │                          on_espnow_trigger_ack             │
+            │                          nodes[i].status=RECORDING         │
+tx_task     │ pop(pre) + espera post             │ pop(pre)+espera post  │
+            │ sd_save_measurement                │ sd_save_measurement   │
+            │─slave_client_send_measurement──── →│                       │
+            │                          on_slave_measurement              │
+            │                                    │─send_raw───────────── → binario
+            │ IDLE                               │ IDLE                  │
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+## Master detecta la vibracion
+
+    vigilante_task (master):
+    circ_buffer_peek_last(&g_buffer, buf, 22)
+    RMS > threshold && cooldown OK
+    g_role == NODE_ROLE_MASTER →
+        g_trigger_slot   = g_current_slot
+        g_trigger_source = TRIGGER_SOURCE_AUTO
+        g_trigger_ts     = now_ms()
+        g_buffer_frozen  = true
+        g_post_count     = 0
+        g_post_active    = true
+        xEventGroupSetBits(g_eventos, EVT_VIBRACION)   ← bit diferente al del esclavo
+        espnow_send_trigger(BROADCAST, slot, AUTO, ts)
+            |→ esclavos reciben MSG_TRIGGER
+                on_espnow_trigger → congela sus buffers → EVT_TRIGGER
+                espnow_send_trigger_ack → master recibe ACK
+
+    Desde ahi tx_task del master y de cada esclavo graban en paralelo igual que el master
+
+    - Si la pc solicita datos por CMD_START
+    wifi_manager (TCP/5000):
+    recibe "CMD_START\n"
+        |→ on_wifi_start():
+                g_role == MASTER && status != RECORDING → continua
+                g_trigger_slot   = g_current_slot
+                g_trigger_source = TRIGGER_SOURCE_MANUAL   ← diferencia
+                g_trigger_ts     = now_ms()
+                g_buffer_frozen  = true
+                g_post_count     = 0
+                g_post_active    = true
+                espnow_send_trigger(BROADCAST, slot, MANUAL, ts)
+                    |→ esclavos: on_espnow_trigger → congela → EVT_TRIGGER
+                xEventGroupSetBits(g_eventos, EVT_TRIGGER)
+                    |→ tx_task del master despierta
+
+    . tx_task graba exactamente igual — la unica diferencia es m->trigger_source = TRIGGER_SOURCE_MANUAL en el header de la medicion
+    . Lo que NO hace: no hay wifi_manager_send_event aqui — la PC ya sabe que disparo porque ella misma mando CMD_START. El evento "EVENT TRIGGER" solo se manda cuando el disparo es automatico (Vigilante)
+
+    - PC envia CMD_STOP
+
+        wifi_manager (TCP/5000):
+        recibe "CMD_STOP\n"
+            |→ on_wifi_stop():
+                    espnow_send_stop(BROADCAST)
+                        |→ esclavos: on_espnow_stop()
+                                xEventGroupSetBits(g_eventos, EVT_STOP)
+                                espnow_send_stop_ack(g_master_mac, 0)
+                    xEventGroupSetBits(g_eventos, EVT_STOP)   ← tambien el master
+
+
+    . El bit EVT_STOP interrumpe tx_task en su loop de espera del post-trigger:
+
+        tx_task (master y esclavo):
+        while (g_post_count < post) {
+            if (xEventGroupGetBits(g_eventos) & EVT_STOP) {
+                xEventGroupClearBits(g_eventos, EVT_STOP)
+                break   ← sale con las muestras que tenga hasta ese momento
+            }
+            vTaskDelay(10ms)
+        }
+
+        post_got = g_post_count   ← lo que se acumulo hasta el STOP
+        memcpy(g_post_buf → samples_ptr + pre_got, post_got muestras)
+        // guarda medicion incompleta igual
+        sd_save_measurement(m)
+        g_status = IDLE
+
+    
+    - En modo STREAM el STOP actua igual pero en otro loop:
+
+        tx_task modo stream:
+        while (1) {
+            if (EVT_STOP) → break
+            circ_buffer_pop → envia chunk
+        }
+        g_status = IDLE
+
+    - RESUMEN
+                        ┌─ vigilante_task (esclavo) → trigger_notify → master
+    Deteccion auto ─────┤
+                        |─ vigilante_task (master)  → directo a tx_task
+
+    Manual (CMD_START) ─── wifi_manager → on_wifi_start → tx_task
+
+    STOP ───────────────── wifi_manager → on_wifi_stop → EVT_STOP → tx_task sale del loop
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+## Solicitar datos (CMD_GET_DATA)
+    - Master
+    PC → TCP/5000: "CMD_GET_DATA MAC=aa:bb:cc:dd:ee:ff SLOT=0\n"
+
+    wifi_manager → on_wifi_get_data(mac, slot, fd):
+        mac_equal(mac, g_own_mac) → true
+
+        xSemaphoreTake(g_slots_mutex)
+        m = g_slots[0]              ← lee directo de PSRAM
+        xSemaphoreGive(g_slots_mutex)
+
+        m == NULL → responde ERROR
+
+        // Arma el paquete binario
+        meas_pkt_hdr_t hdr = {
+            .type   = MEAS_PKT_DATA (0x02)
+            .mac    = mac del master
+            .slot   = 0
+            .length = sizeof(measurement_t) + 337*6 bytes
+        }
+        buf = malloc(sizeof(hdr) + total)
+        memcpy(buf, &hdr, sizeof(hdr))
+        memcpy(buf + sizeof(hdr), m, total)   ← copia measurement_t completo
+        wifi_manager_send_raw(buf, total)     → PC recibe binario
+        free(buf)
+
+    - Esclavo
+    PC → TCP/5000: "CMD_GET_DATA MAC=11:22:33:44:55:66 SLOT=0\n"
+
+    wifi_manager → on_wifi_get_data(mac, slot, fd):
+        mac_equal(mac, g_own_mac) → false
+
+        s_pending_data_request = true    ← flag para on_slave_measurement
+        espnow_send_data_request(mac, slot)
+            |→ MSG_DATA_REQUEST → esclavo
+
+    [ESCLAVO]
+    espnow_rx_task → on_espnow_data_request(msg):
+        xSemaphoreTake(g_slots_mutex)
+        m = g_slots[msg->slot_index]
+        xSemaphoreGive(g_slots_mutex)
+
+        m == NULL → log warning, no hace nada
+
+        slave_client_send_measurement(m)
+            |→ TCP/5001 → master
+
+    [MASTER]
+    slave_server → on_slave_measurement(mac, slot, meas):
+        wifi_manager_is_connected() → true
+        g_auto_sync == false && s_pending_data_request == true → pasa
+        s_pending_data_request = false    ← consume el flag
+
+        // Arma el mismo paquete binario
+        meas_pkt_hdr_t hdr = { MEAS_PKT_DATA, mac_esclavo, slot, length }
+        wifi_manager_send_raw(buf, total) → PC recibe binario
+    
+    .El paquete que llega a la PC es identico en ambos casos — la PC distingue el origen por hdr.mac
+
+    (####ANALISIS DE LA IA, VER:  si la PC pide datos de dos esclavos seguidos antes de que el primero responda, s_pending_data_request solo tiene un flag booleano — el segundo request pisaria al primero. Es una limitacion actual del diseño.)
+
+    - Auto-sync → Funcion solicitada desde la pc (CMD_SYNC_START) --------------------------- VER -------------------------
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+## Stream (CMD_STREAM_START)
+
+    - Master
+        PC → TCP/5000: "CMD_STREAM_START MAC=aa:bb:cc:dd:ee:ff\n"
+
+        wifi_manager → on_wifi_stream_start(mac):
+            memcpy(g_stream_target, mac, 6)
+            mac_equal(mac, g_own_mac) → true
+
+            g_status        = NODE_STATUS_STREAMING
+            g_buffer_frozen = true    ← congela para preservar pre
+            g_post_count    = 0
+            g_post_active   = false   ← diferencia vs grabacion: no llena post_buf
+            xEventGroupSetBits(g_eventos, EVT_TRIGGER)
+                |→ despierta tx_task
+
+            tx_task en modo STREAM:
+
+                tx_task (master):
+                    g_status == STREAMING → rama stream
+
+                    // Paso 1: drena el pre del buffer congelado
+                    remaining = pre = 112 muestras
+                    while (remaining > 0):
+                        circ_buffer_pop(&g_buffer, chunk, 45)   ← de a 45 muestras
+                        wifi_manager_send_stream_chunk(chunk, got)
+                            |→ PC recibe stream_chunk_hdr_t + muestras (binario)
+                        remaining -= got
+
+                    // Descongela — sensor_task vuelve a escribir en g_buffer
+                    g_buffer_frozen = false
+
+                    // Paso 2: stream continuo hasta STOP
+                    while (1):
+                        EVT_STOP? → break
+                        circ_buffer_pop(&g_buffer, chunk, 45)
+                        got > 0 → wifi_manager_send_stream_chunk → PC
+                        got == 0 → vTaskDelay(10ms)   ← espera que sensor_task llene
+
+                    g_status = IDLE
+
+                    IMPORTANTE: No guarda nada en g_slots ni en SD
+
+    - Esclavo
+        PC → TCP/5000: "CMD_STREAM_START MAC=11:22:33:44:55:66\n"
+
+        wifi_manager → on_wifi_stream_start(mac):
+            memcpy(g_stream_target, mac, 6)
+            mac_equal(mac, g_own_mac) → false
+
+            espnow_send_stream_start(mac)
+                |→ MSG_STREAM_START → esclavo
+
+        [ESCLAVO]
+        espnow_rx_task → on_espnow_stream_start(msg):
+            g_status        = NODE_STATUS_STREAMING
+            g_buffer_frozen = true
+            g_post_count    = 0
+            g_post_active   = false
+            xEventGroupSetBits(g_eventos, EVT_TRIGGER)
+                |→ despierta tx_task del esclavo
+
+        tx_task (esclavo) modo STREAM:
+            // Paso 1: pre del buffer congelado
+            circ_buffer_pop → chunk → slave_client_send_stream_chunk(chunk, got)
+                |→ TCP/5001 → master
+
+            g_buffer_frozen = false
+
+            // Paso 2: stream continuo
+            while (1):
+                EVT_STOP? → break
+                circ_buffer_pop → chunk → slave_client_send_stream_chunk
+                    |→ TCP/5001 → master
+
+        [MASTER]
+        slave_server → on_slave_stream_chunk(mac, samples, count):
+            stream_chunk_hdr_t hdr = { STREAM_PKT_CHUNK, mac_esclavo, count }
+            wifi_manager_send_raw(hdr + samples)
+                |→ PC recibe igual que el master, pero con mac del esclavo
+
+    - CMD_STREAM_START_ALL
+        PC → TCP/5000: "CMD_STREAM_START_ALL\n"
+
+        wifi_manager → on_wifi_stream_start_all():
+            memset(g_stream_target, 0, 6)   ← MAC cero = modo "all"
+
+            // Master se pone a streamear
+            g_status        = NODE_STATUS_STREAMING
+            g_buffer_frozen = true
+            g_post_active   = false
+            xEventGroupSetBits(g_eventos, EVT_TRIGGER)
+
+            // Ordena a cada esclavo conocido
+            for i in g_nodes[]:
+                espnow_send_stream_start(g_nodes[i].mac)
+                    |→ cada esclavo: on_espnow_stream_start → tx_task
+
+        Desde ahi corre en paralelo:
+
+        master tx_task ──────────────────────────── wifi_manager_send_stream_chunk → PC
+        esclavo[0] tx_task → TCP/5001 → on_slave_stream_chunk → wifi_manager_send_raw → PC
+        esclavo[1] tx_task → TCP/5001 → on_slave_stream_chunk → wifi_manager_send_raw → PC
+        La PC distingue el origen de cada chunk por stream_chunk_hdr_t.ma
+
+    - CMD_STREAM_STOP / CMD_STREAM_STOP_ALL
+        PC → TCP/5000: "CMD_STREAM_STOP\n"
+
+        wifi_manager → on_wifi_stream_stop(NULL):
+            target = g_stream_target   ← MAC guardada en stream_start (Cuando solo hay un nodo con stream)
+
+            target == zero (modo all) →
+                on_wifi_stream_stop_all():
+                    xEventGroupSetBits(g_eventos, EVT_STOP)   ← detiene master
+                    for i in g_nodes[]:
+                        espnow_send_stream_stop(g_nodes[i].mac)
+                            |→ esclavos: on_espnow_stream_stop → EVT_STOP
+
+            target == g_own_mac →
+                xEventGroupSetBits(g_eventos, EVT_STOP)       ← solo master
+
+            target == esclavo →
+                espnow_send_stream_stop(target)               ← solo ese esclavo
+
+        EVT_STOP interrumpe el loop de stream en tx_task de cada nodo:
+
+        tx_task (cualquier nodo):
+            while (1):
+                EVT_STOP set → xEventGroupClearBits(EVT_STOP) → break
+
+            g_status = IDLE
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+## Configuracion (CMD_SET_CONFIG)
+
+    PC → "CMD_SET_CONFIG PRE=500 POST=1000 MANUAL=2000 THR=1.5\n"
+
+    handle_command:
+        strncmp(line, "CMD_SET_CONFIG") → match
+        config = { defaults }   ← carga valores por defecto primero
+        sscanf(line, "CMD_SET_CONFIG PRE=%hu POST=%hu MANUAL=%hu THR=%f",
+            &pre, &post, &manual, &thr)   ← parsea lo que venga, deja defaults para lo que falte
+        on_set_config(&config)
+            |→ on_wifi_set_config(cfg):
+                    apply_config(cfg)
+                        xSemaphoreTake(g_config_mutex)
+                        memcpy(&g_config, cfg)   ← actualiza config global
+                        xSemaphoreGive(g_config_mutex)
+                    espnow_send_config(BROADCAST, cfg)
+                        |→ MSG_CONFIG → todos los esclavos
+
+        [ESCLAVO]
+        espnow_rx_task → on_espnow_config(msg):
+            apply_config(&msg->config)   ← misma funcion, actualiza su g_config local
+            espnow_send_config_ack(g_master_mac, ok=1)
+                |→ master: on_espnow_config_ack → log solamente
+
+        socket_send_str(fd, "OK\n") → PC
+
+## Status de los nodos (CMD_GET_STATUS)
+
+    PC → "CMD_GET_STATUS\n"
+
+    handle_command:
+        strcmp(line, "CMD_GET_STATUS") → todo ok
+        json[512] buffer en stack
+        on_get_status(json, 512)
+            |→ on_wifi_get_status(out_json, max_len):
+
+                // Master propio — siempre primero
+                snprintf: {"role":"master","nodes":[
+                snprintf: {"mac":"aa:bb:cc:dd:ee:ff",
+                            "status":"idle",
+                            "slot":0,
+                            "online":true,
+                            "role":"master"}
+
+                xSemaphoreTake(g_nodes_mutex)
+                for cada nodo en g_nodes[]:
+                    offline = (now_ms() - last_seen_ms) > 15000
+                    snprintf: ,{"mac":"11:22:33:44:55:66",
+                                "status":"idle",
+                                "slot":0,
+                                "online":true/false}
+                xSemaphoreGive(g_nodes_mutex)
+
+                snprintf: ]}
+
+        socket_send_str(fd, "STATUS {json}\n") → PC
+
+    Respuesta que recibe la PC:
+        STATUS {"role":"master","nodes":[
+        {"mac":"aa:bb:cc:dd:ee:ff","status":"idle","slot":0,"online":true,"role":"master"},
+        {"mac":"11:22:33:44:55:66","status":"recording","slot":1,"online":true},
+        {"mac":"77:88:99:aa:bb:cc","status":"idle","slot":0,"online":false}
+        ]}
+    
+    HAY TEXTO EN ESTOS CASOS, PREGUNTAR SI ES EFICIENTE
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+## Arranque de los nodos
+
+    app_main():
+        LED, NVS, event loop
+        gpio CS → SPI2 + icm20948_init()
+        SD → sd_init()
+        circ_buffer_init(&g_buffer)
+        mutex x 3 + event group
+
+        wifi_base_init()
+            |→ AP oculto (ssid="ESP_NOW_SLAVE", ssid_hidden=1)
+            sin contraseña, sin conexiones — solo para que ESP-NOW tenga WiFi
+
+        // Primera init ESP-NOW: solo escucha heartbeats
+        espnow_callbacks_t ecbs_disc = { .on_heartbeat = discovery_hb_cb }
+        espnow_manager_init(&ecbs_disc)
+            |→ crea cola s_rx_queue (16 items)
+            esp_now_init()
+            registra espnow_recv_cb + espnow_send_cb
+            agrega peer broadcast FF:FF:FF:FF:FF:FF
+            xTaskCreate(espnow_rx_task, Core 0, prio 2)
+
+        espnow_manager_get_own_mac(g_own_mac)
+
+        discover_role():
+            s_master_found = false
+            vTaskDelay(10000ms)   ← espera 10 segundos escuchando
+
+            [durante esa espera, el master envia heartbeat cada 5s]
+            espnow_recv_cb (ISR WiFi):
+                copia paquete a s_rx_queue — retorna inmediatamente
+            espnow_rx_task:
+                xQueueReceive → MSG_HEARTBEAT → discovery_hb_cb(msg):
+                    memcpy(g_master_mac, src_mac, 6)
+                    espnow_manager_add_peer(g_master_mac)
+                    s_master_found = true
+
+            s_master_found == true → return NODE_ROLE_SLAVE
+
+        g_role = SLAVE
+        wifi_slave_connect()
+            |→ WIFI_MODE_APSTA (AP oculto + STA) → Necesito ambos para ESP-NOW y TCP
+            conecta a SSID "BRIDGE_MONITOR" del master
+            reconexion automatica en STA_DISCONNECTED
+        slave_client_init()
+            |→ TCP/5001 hacia master (con reconexion)
+
+        // Reemplaza callbacks minimos por el set completo
+        espnow_manager_update_callbacks(&ecbs)
+
+        xTaskCreate x 5 (sensor, vigilante, tx, heartbeat, button) → La ram no explota por ahora
+
+    - NO HAY MASTER (se autoproclama master)
+        discover_role():
+        vTaskDelay(10000ms)
+        s_master_found == false → return NODE_ROLE_MASTER
+
+        g_role = MASTER
+        memcpy(g_master_mac, g_own_mac, 6)   ← su propio master
+        gpio_set_level(LED_PIN, 1)            ← LED encendido
+
+        wifi_manager_init(&wcbs)
+            |→ reconfigura AP: SSID="BRIDGE_MONITOR" visible, WPA2
+            xTaskCreate(server_task, TCP/5000)
+
+        slave_server_init(&scbs)
+            |→ xTaskCreate(slave_server_task, TCP/5001)
+
+        espnow_manager_update_callbacks(&ecbs)
+        xTaskCreate x 5
+
+    - CAMBIO DE MASTER - SE PRESIONA EL BOTON
+        button_task:
+            gpio_get_level(PIN_BTN_MASTER) → 0
+            vTaskDelay(20ms) debounce
+            gpio_get_level → sigue en 0 → confirma pulsacion
+
+            g_role = NODE_ROLE_MASTER
+            espnow_send_new_master(BROADCAST)
+                |→ MSG_NEW_MASTER → todos los nodos
+
+            wifi_manager_init(&wcbs)
+                |→ levanta AP visible + TCP/5000
+            slave_server_init(&scbs)
+                |→ TCP/5001 escuchando
+            LED = 1
+    
+        - En el master actual que recibe MSG_NEW_MASTER:
+            espnow_rx_task → on_espnow_new_master(msg):
+            g_role == NODE_ROLE_MASTER →
+                ESP_LOGW("Cediendo rol MASTER")
+                vTaskDelay(500ms)   ← tiempo para que el log se imprima
+                esp_restart()       ← reinicio completo del sistema
+                    |→ vuelve a boot → discover_role → encuentra al nuevo master
+                    → asume NODE_ROLE_SLAVE
+        
+        - En los esclavos que reciben MSG_NEW_MASTER:
+            espnow_rx_task → on_espnow_new_master(msg):
+            g_role == NODE_ROLE_SLAVE →
+                memcpy(g_master_mac, candidate_mac, 6)
+                espnow_send_new_master_ack(candidate)
+                xEventGroupSetBits(g_eventos, EVT_NUEVO_MASTER)
+                    |→ (bit seteado pero actualmente ninguna tarea lo espera)
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+## Callbacks (Desacoplamos los modulos)
+
+    - ESP-NOW
+        // Paso 1: init minimo para descubrimiento
+        espnow_callbacks_t ecbs_disc = {
+            .on_heartbeat = discovery_hb_cb   // solo uno activo
+        };
+        espnow_manager_init(&ecbs_disc)
+            |→ memcpy(&s_callbacks, &ecbs_disc, sizeof)   // copia al estado interno
+
+        // Paso 2: despues de discover_role, reemplaza con el set completo
+        espnow_callbacks_t ecbs = {
+            .on_trigger        = on_espnow_trigger,
+            .on_trigger_ack    = on_espnow_trigger_ack,
+            .on_trigger_notify = on_espnow_trigger_notify,
+            .on_stop           = on_espnow_stop,
+            .on_config         = on_espnow_config,
+            .on_heartbeat      = on_espnow_heartbeat,
+            ...
+        };
+        espnow_manager_update_callbacks(&ecbs)
+            |→ memcpy(&s_callbacks, &ecbs, sizeof)   // sobreescribe
+        
+        Invocacion — el camino de un paquete entrante:
+
+        [radio WiFi]
+            ↓
+        espnow_recv_cb()          ← ISR, NO puede bloquear
+            item.data = paquete
+            xQueueSend(s_rx_queue, &item, 0)   ← no bloqueante, descarta si llena
+            return
+            ↓
+        espnow_rx_task()          ← tarea separada, puede hacer cualquier cosa
+            xQueueReceive(portMAX_DELAY)
+            hdr = (msg_header_t *)item.data
+            switch(hdr->msg_type):
+                case MSG_TRIGGER:
+                    if (s_callbacks.on_trigger != NULL)   ← chequea que exista
+                        s_callbacks.on_trigger((msg_trigger_t *)item.data)
+                            |→ on_espnow_trigger() en main.c
+
+    - WiFi/TCP
+        Registro:
+
+            wifi_callbacks_t wcbs = {
+                .on_start      = on_wifi_start,
+                .on_stop       = on_wifi_stop,
+                .on_get_status = on_wifi_get_status,
+                .on_set_config = on_wifi_set_config,
+                .on_get_data   = on_wifi_get_data,
+                .on_stream_start     = on_wifi_stream_start,
+                .on_stream_stop      = on_wifi_stream_stop,
+                .on_stream_start_all = on_wifi_stream_start_all,
+                .on_stream_stop_all  = on_wifi_stream_stop_all,
+                .on_sync_start = on_wifi_sync_start,
+                .on_sync_stop  = on_wifi_sync_stop,
+            };
+            wifi_manager_init(&wcbs)
+                |→ memcpy(&s_callbacks, &wcbs, sizeof)
+
+        Invocacion — camino de un comando TCP:
+
+            [PC envia "CMD_START\n"]
+                ↓
+            server_task()
+                accept() → client_fd
+                xTaskCreate(client_task, fd)
+                ↓
+            client_task()
+                recv(fd, &c, 1) byte a byte
+                c == '\n' → handle_command(fd, line)
+                    ↓
+                strcmp(line, "CMD_START")
+                s_callbacks.on_start()        ← invoca el callback
+                    |→ on_wifi_start() en main.c
+                socket_send_str(fd, "OK\n")
+
+    - Slave Server
+        Registro:
+
+            slave_server_callbacks_t scbs = {
+                .on_measurement  = on_slave_measurement,
+                .on_stream_chunk = on_slave_stream_chunk,
+            };
+            slave_server_init(&scbs)
+                |→ guarda callbacks internamente
+                xTaskCreate(slave_server_task, TCP/5001)
+
+            Invocacion — camino de datos TCP/5001:
+
+            [esclavo envia medicion por TCP/5001]
+                ↓
+            slave_server_task()
+                accept() → esclavo conectado
+                recv() → SLAVE_PKT_HANDSHAKE (MAC del esclavo)
+                recv() → SLAVE_PKT_MEASUREMENT
+                    ↓
+                scbs.on_measurement(mac, slot, meas)
+                    |→ on_slave_measurement() en main.c
+                            wifi_manager_send_raw() → PC
+
+                recv() → SLAVE_PKT_STREAM_CHUNK
+                    ↓
+                scbs.on_stream_chunk(mac, samples, count)
+                    |→ on_slave_stream_chunk() en main.c
+                            wifi_manager_send_raw() → PC
