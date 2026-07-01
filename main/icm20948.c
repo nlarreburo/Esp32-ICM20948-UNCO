@@ -167,8 +167,11 @@ esp_err_t icm20948_init(icm20948_config_t *config, icm20948_handle_t *handle)
     ret = icm20948_select_bank(handle, 2);
     if (ret != ESP_OK) return ret;
 
-    // ACCEL_CONFIG: bits [2:1]=rango, bit 0=ACCEL_FCHOICE (habilita DLPF)
-    uint8_t acel_config = (config->acel_range << 1) | 0x01;
+    // ACCEL_CONFIG: bits [5:3]=DLPFCFG, bits [2:1]=rango, bit 0=ACCEL_FCHOICE
+    // ACCEL_FCHOICE=1 habilita el DLPF
+    // DLPFCFG=1 → corte a 111.4 Hz — justo por debajo de Nyquist (225/2 = 112.5 Hz)
+    // DLPFCFG=0 (anterior) cortaba a 246 Hz, por encima de Nyquist → aliasing posible
+    uint8_t acel_config = (1 << 3) | (config->acel_range << 1) | 0x01;
     ret = icm20948_write_reg(handle, ICM20948_ACCEL_CONFIG, acel_config);
     if (ret != ESP_OK) return ret;
 
