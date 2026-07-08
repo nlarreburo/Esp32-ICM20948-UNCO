@@ -146,7 +146,7 @@ esp_err_t espnow_send_config_ack(const uint8_t dst_mac[6], uint8_t ok);
 
 //Heartbeat
 
-esp_err_t espnow_send_heartbeat(const uint8_t dst_mac[6], uint32_t timestamp_ms);
+esp_err_t espnow_send_heartbeat(const uint8_t dst_mac[6], uint32_t timestamp_ms, uint8_t current_slot);
 
 esp_err_t espnow_send_heartbeat_ack(const uint8_t dst_mac[6],
                                      node_status_t status,

@@ -15,6 +15,7 @@ static const char *TAG = "SLAVE_CLIENT";
 #define MASTER_IP           "192.168.4.1"
 #define RECONNECT_DELAY_MS  3000
 
+
 //ESTADOS INTERNOS
 
 static int       s_fd        = -1;

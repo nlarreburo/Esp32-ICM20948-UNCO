@@ -111,17 +111,23 @@ static void handle_command(int fd, char *line)
             socket_send_str(fd, RESP_ERROR " callback no registrado\n");
             return;
         }
-        measurement_config_t config = {
-            .pre_trigger_ms     = CONFIG_DEFAULT_PRE_MS,
-            .post_trigger_ms    = CONFIG_DEFAULT_POST_MS,
-            .manual_duration_ms = CONFIG_DEFAULT_MANUAL_MS,
-            .threshold_g        = CONFIG_DEFAULT_THRESHOLD_G,
-        };
-        sscanf(line, CMD_SET_CONFIG " PRE=%hu POST=%hu MANUAL=%hu THR=%f",
-               &config.pre_trigger_ms,
-               &config.post_trigger_ms,
-               &config.manual_duration_ms,
-               &config.threshold_g);
+        measurement_config_t config;
+        if (s_callbacks.on_get_config){
+            s_callbacks.on_get_config(&config);
+        } else {
+            config.pre_trigger_ms     = CONFIG_DEFAULT_PRE_MS;
+            config.post_trigger_ms    = CONFIG_DEFAULT_POST_MS;
+            config.manual_duration_ms = CONFIG_DEFAULT_MANUAL_MS;
+            config.threshold_g        = CONFIG_DEFAULT_THRESHOLD_G;
+        }
+        uint16_t val_u;
+        float    val_f;
+
+        if (sscanf(line, "%*s PRE=%hu",    &val_u) == 1) config.pre_trigger_ms     = val_u;
+        if (sscanf(line, "%*s POST=%hu",   &val_u) == 1) config.post_trigger_ms    = val_u;
+        if (sscanf(line, "%*s MANUAL=%hu", &val_u) == 1) config.manual_duration_ms = val_u;
+        if (sscanf(line, "%*s THR=%f",     &val_f) == 1) config.threshold_g        = val_f;
+
         esp_err_t ret = s_callbacks.on_set_config(&config);
         socket_send_str(fd, ret == ESP_OK ? RESP_OK "\n" : RESP_ERROR " fallo aplicar config\n");
         return;
@@ -355,6 +361,9 @@ static void server_task(void *pvParameters)
             close(client_fd);
             continue;
         }
+
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         // Crear tarea para manejar este cliente
         // Se pasa el fd como puntero (cast de int a intptr_t)

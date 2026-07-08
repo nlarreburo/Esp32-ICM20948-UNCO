@@ -136,6 +136,7 @@ typedef struct {
     msg_header_t header;
     uint32_t     timestamp_ms;   // timestamp del master — los nodos lo usan
                                  // para detectar si el master se reinicio
+    uint8_t      current_slot; //slot
 } __attribute__((packed)) msg_heartbeat_t;
 
 typedef struct {

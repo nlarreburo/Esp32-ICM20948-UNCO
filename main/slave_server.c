@@ -60,7 +60,7 @@ static void slave_rx_task(void *arg)
     int idx = (int)arg;
     int fd  = s_conns[idx].fd;
 
-    // — Handshake: recibir MAC del esclavo —
+    //Handshake: recibir MAC del esclavo
     slave_pkt_header_t hdr;
     slave_pkt_handshake_t hs;
 
@@ -81,7 +81,7 @@ static void slave_rx_task(void *arg)
     slave_pkt_header_t ack = { .type = SLAVE_PKT_HANDSHAKE_ACK, .length = 0 };
     send(fd, &ack, sizeof(ack), 0);
 
-    // — Loop principal: recibir paquetes —
+    //Loop principal: recibir paquetes
     while (1) {
         if (recv_exact(fd, &hdr, sizeof(hdr)) != ESP_OK) break;
 
@@ -157,6 +157,9 @@ static void slave_accept_task(void *arg)
             continue;
         }
 
+        struct timeval tv = {.tv_sec = 30, .tv_usec = 0};
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        
         s_conns[idx].fd = client_fd;
 
         char task_name[20];

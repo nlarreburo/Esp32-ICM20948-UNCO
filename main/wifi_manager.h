@@ -39,6 +39,7 @@ typedef esp_err_t (*wifi_cb_stream_stop_t)(const uint8_t *mac);
 typedef esp_err_t (*wifi_cb_stream_start_all_t)(void);
 typedef esp_err_t (*wifi_cb_stream_stop_all_t)(void);
 typedef esp_err_t (*wifi_cb_get_data_t)(const uint8_t *mac, uint8_t slot, int fd);
+typedef esp_err_t (*wifi_cb_get_config_t)(measurement_config_t *out);
 
 typedef struct {
     wifi_cb_start_t          on_start;
@@ -52,6 +53,7 @@ typedef struct {
     wifi_cb_stream_start_all_t on_stream_start_all;
     wifi_cb_stream_stop_all_t  on_stream_stop_all;
     wifi_cb_get_data_t       on_get_data;
+    wifi_cb_get_config_t     on_get_config;
 } wifi_callbacks_t;
 
 //----------------------

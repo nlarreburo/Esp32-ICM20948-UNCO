@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "esp_vfs_fat.h"
@@ -73,6 +74,13 @@
 #define MAX_NODES               8       //Cantidad de nodos maximo en la red (chequear comportamiento de ram)
 #define MEASUREMENT_SLOTS       5       //Cantidad de mediones almacenadas en PSRAM/RAM
 
+//NVS CONFIG
+
+#define NVS_NAMESPACE   "config"
+#define NVS_KEY_PRE     "pre_ms"
+#define NVS_KEY_POST    "post_ms"
+#define NVS_KEY_MANUAL  "manual_ms"
+#define NVS_KEY_THR     "thr_g"
 //----------------------
 // CONFIGURACION STEAM
 //----------------------
@@ -95,6 +103,7 @@ static measurement_config_t g_config = {                //g_config guarda los pa
     .threshold_g        = CONFIG_DEFAULT_THRESHOLD_G,
 };  
 static SemaphoreHandle_t g_config_mutex = NULL;         //Mutex para g_config
+static SemaphoreHandle_t g_trigger_mutex = NULL;        //Mutex para trigger
 
 static node_role_t   g_role              = NODE_ROLE_SLAVE;  //Inicializamos los nodos como esclavos
 static node_status_t g_status            = NODE_STATUS_IDLE; //Estados: IDLE, RECORDING O STREAMING
@@ -132,7 +141,7 @@ static volatile bool s_pending_data_request = false;
 
 // Buffer post-trigger — sensor_task escribe aca mientras el circular esta congelado
 // sensor_task llena este buffer con las muestras nuevas despues del trigger
-#define POST_TRIGGER_MAX_SAMPLES  900   // 4 segundos a 225Hz
+#define POST_TRIGGER_MAX_SAMPLES  13500   // 60 segundos a 225Hz
 static icm20948_raw_sample_t g_post_buf[POST_TRIGGER_MAX_SAMPLES];
 static volatile uint16_t g_post_count  = 0;    // muestras acumuladas
 static volatile bool     g_post_active = false; // true = sensor_task llenando post
@@ -183,18 +192,59 @@ static int find_or_add_node(const uint8_t mac[6])               //Busca un nodo 
     return -1;
 }
 
-static void apply_config(const measurement_config_t *cfg)   //Actualizar g_config con la nueva cfg
+//nvs config
+
+static void config_load(void)
 {
+    nvs_handle_t h;
+    if (nvs_open("config", NVS_READONLY, &h) != ESP_OK) return;
+
+    uint16_t val_u;
+    uint32_t val_raw;  // float se guarda como uint32_t (mismo tamaño en memoria)
+
+    if (nvs_get_u16(h, "pre_ms",    &val_u) == ESP_OK) g_config.pre_trigger_ms     = val_u;
+    if (nvs_get_u16(h, "post_ms",   &val_u) == ESP_OK) g_config.post_trigger_ms    = val_u;
+    if (nvs_get_u16(h, "manual_ms", &val_u) == ESP_OK) g_config.manual_duration_ms = val_u;
+    if (nvs_get_u32(h, "thr_g",     &val_raw) == ESP_OK) memcpy(&g_config.threshold_g, &val_raw, 4);
+
+    nvs_close(h);
+    ESP_LOGI(TAG, "Config cargada desde NVS");
+}
+
+static void config_save(const measurement_config_t *cfg)
+{
+    nvs_handle_t h;
+    if (nvs_open("config", NVS_READWRITE, &h) != ESP_OK) return;
+
+    uint32_t val_raw;
+    memcpy(&val_raw, &cfg->threshold_g, 4);
+
+    nvs_set_u16(h, "pre_ms",    cfg->pre_trigger_ms);
+    nvs_set_u16(h, "post_ms",   cfg->post_trigger_ms);
+    nvs_set_u16(h, "manual_ms", cfg->manual_duration_ms);
+    nvs_set_u32(h, "thr_g",     val_raw);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static esp_err_t apply_config(const measurement_config_t *cfg)   //Actualizar g_config con la nueva cfg
+{
+    if (cfg->manual_duration_ms<= 0) return ESP_ERR_INVALID_ARG;
+    if (cfg->post_trigger_ms<= 0) return ESP_ERR_INVALID_ARG;
+    if (cfg->threshold_g<= 0.0f) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(g_config_mutex, portMAX_DELAY);
     memcpy(&g_config, cfg, sizeof(measurement_config_t));
     xSemaphoreGive(g_config_mutex);
     ESP_LOGI(TAG, "Config: PRE=%dms POST=%dms THR=%.2fg",
              cfg->pre_trigger_ms, cfg->post_trigger_ms, cfg->threshold_g);
+    config_save(cfg);
+    return ESP_OK;
 }
 
 static void on_espnow_config(const msg_config_t *msg)
 {
-    apply_config(&msg->config);
+    esp_err_t ret = apply_config(&msg->config);
+    espnow_send_config_ack(g_master_mac, ret == ESP_OK ? 1 : 0);
 }
 
 //----------------------
@@ -296,8 +346,13 @@ static void sd_save_measurement(measurement_t *m)
 static void on_espnow_trigger_notify(const msg_trigger_notify_t *msg) //Funcion de 
 {
     if (g_role != NODE_ROLE_MASTER) return;         //Chequeo de master
-    if (g_status == NODE_STATUS_RECORDING) return;  //Chequeo de no estar ya grabando
-
+    xSemaphoreTake(g_trigger_mutex, portMAX_DELAY);
+    if (g_status != NODE_STATUS_IDLE){ //Chequeo de no estar ya grabando
+        xSemaphoreGive(g_trigger_mutex);
+        return;
+    }  
+    g_status = NODE_STATUS_RECORDING;
+    xSemaphoreGive(g_trigger_mutex);
     //Definimos los parametros de trigger
     g_trigger_slot   = g_current_slot;
     g_trigger_source = TRIGGER_SOURCE_AUTO;
@@ -364,16 +419,31 @@ static void on_espnow_stop(const msg_stop_t *msg)
     espnow_send_stop_ack(g_master_mac, 0);
 }
 
-static void on_espnow_config_ack(const msg_config_ack_t *msg)       //Esclavo confirma nueva config
+static void on_espnow_config_ack(const msg_config_ack_t *msg)       //ACK Esclavo confirma nueva config
 {
+    int idx = find_or_add_node(msg->header.src_mac);
+    if (idx >= 0){
+        xSemaphoreTake(g_nodes_mutex, portMAX_DELAY);
+        g_nodes[idx].config_sync = msg->ok;
+        xSemaphoreGive(g_nodes_mutex);
+    }
     ESP_LOGI(TAG, "CONFIG_ACK de %02x:...:%02x ok=%d",
              msg->header.src_mac[0], msg->header.src_mac[5], msg->ok);
+    char event[64];
+    snprintf(event, sizeof(event),
+             "EVENT CONFIG_ACK %02x:%02x:%02x:%02x:%02x:%02x ok=%d\n",
+             msg->header.src_mac[0], msg->header.src_mac[1],
+             msg->header.src_mac[2], msg->header.src_mac[3],
+             msg->header.src_mac[4], msg->header.src_mac[5],
+             msg->ok);
+    wifi_manager_send_event(event);
 }
 
 static void on_espnow_heartbeat(const msg_heartbeat_t *msg)         //Esclavo recibe heartbeat del master
 {
     if (g_role != NODE_ROLE_SLAVE) return;
     memcpy(g_master_mac, msg->header.src_mac, 6);
+    g_current_slot = msg->current_slot; //Asignamos el slot al esclavo segundo lo indica el master
     espnow_manager_add_peer(g_master_mac); //Agregamos la mac del master como peer
     espnow_send_heartbeat_ack(g_master_mac, g_status,       //Contesta al heartbeat
                                g_current_slot, esp_get_free_heap_size());
@@ -408,7 +478,15 @@ static void on_espnow_heartbeat_ack(const msg_heartbeat_ack_t *msg) //Master rec
     g_nodes[idx].status       = msg->status;
     g_nodes[idx].current_slot = msg->current_slot;
     g_nodes[idx].last_seen_ms = now_ms();
+    uint8_t needs_config = !g_nodes[idx].config_sync;
     xSemaphoreGive(g_nodes_mutex);
+
+    if (needs_config){
+        xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+        measurement_config_t cfg = g_config;
+        xSemaphoreGive(g_config_mutex);
+        espnow_send_config(msg->header.src_mac, &cfg);
+    }
 }
 
 
@@ -470,8 +548,14 @@ static void on_espnow_stream_stop(const msg_stream_stop_t *msg)
 
 static esp_err_t on_wifi_start(void)    //CMD_START
 {
-    if (g_role != NODE_ROLE_MASTER || g_status == NODE_STATUS_RECORDING)
+    if (g_role != NODE_ROLE_MASTER) return ESP_FAIL;
+    xSemaphoreTake(g_trigger_mutex, portMAX_DELAY);
+    if (g_status != NODE_STATUS_IDLE){
+        xSemaphoreGive(g_trigger_mutex);
         return ESP_FAIL;
+    }
+    g_status = NODE_STATUS_RECORDING;
+    xSemaphoreGive(g_trigger_mutex);
     g_trigger_slot   = g_current_slot;
     g_trigger_source = TRIGGER_SOURCE_MANUAL;
     g_trigger_ts     = now_ms();
@@ -489,8 +573,17 @@ static esp_err_t on_wifi_start(void)    //CMD_START
 
 static esp_err_t on_wifi_stop(void)     //CMD_STOP
 {
+    if (g_status == NODE_STATUS_IDLE) return ESP_FAIL;
     espnow_send_stop(ESPNOW_BROADCAST_MAC);
     xEventGroupSetBits(g_eventos, EVT_STOP);
+    return ESP_OK;
+}
+
+static esp_err_t on_wifi_get_config(measurement_config_t *out)
+{
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    *out = g_config;
+    xSemaphoreGive(g_config_mutex);
     return ESP_OK;
 }
 
@@ -498,8 +591,20 @@ static esp_err_t on_wifi_get_status(char *out_json, size_t max_len)     //CMD_GE
 {
     int pos = 0;
     pos += snprintf(out_json + pos, max_len - pos,
-                    "{\"role\":\"%s\",\"nodes\":[",
+                    "{\"role\":\"%s\",",
                     g_role == NODE_ROLE_MASTER ? "master" : "slave");
+
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    measurement_config_t cfg = g_config;
+    xSemaphoreGive(g_config_mutex);
+
+    pos += snprintf(out_json + pos, max_len - pos,
+                    "\"config\":{\"pre_ms\":%d,\"post_ms\":%d,"
+                    "\"manual_ms\":%d,\"thr_g\":%.2f},",
+                    cfg.pre_trigger_ms, cfg.post_trigger_ms,
+                    cfg.manual_duration_ms, cfg.threshold_g);
+
+    pos += snprintf(out_json + pos, max_len - pos, "\"nodes\":[");
 
     // Master propio — siempre el primer nodo, siempre online
     const char *own_st;
@@ -540,8 +645,13 @@ static esp_err_t on_wifi_get_status(char *out_json, size_t max_len)     //CMD_GE
 
 static esp_err_t on_wifi_set_config(const measurement_config_t *cfg)    //CMD_SET_CONFIG
 {
-    apply_config(cfg);  //actualiza
+    esp_err_t ret = apply_config(cfg);  //actualiza
+    if (ret != ESP_OK) return ret; 
     espnow_send_config(ESPNOW_BROADCAST_MAC, cfg);  //propaga a esclavos
+    xSemaphoreTake(g_nodes_mutex, portMAX_DELAY);
+        for (int i = 0; i < g_node_count; i++)
+            g_nodes[i].config_sync = 0;
+    xSemaphoreGive(g_nodes_mutex);
     return ESP_OK;
 }
 
@@ -726,6 +836,8 @@ static esp_err_t spi_bus_init(void)
     return spi_bus_initialize(ICM_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
 }
 
+
+
 //----------------------
 // TAREAS
 //----------------------
@@ -796,17 +908,24 @@ static void vigilante_task(void *pv)
                 if (g_role == NODE_ROLE_SLAVE) {
                     espnow_send_trigger_notify(g_master_mac, rms, now_ms());
                 } else {
-                    g_trigger_slot   = g_current_slot;
-                    g_trigger_source = TRIGGER_SOURCE_AUTO;
-                    g_trigger_ts     = now_ms();
-                    g_trigger_head   = g_buffer.head;
-
-                    // Congelar el buffer circular — preserva el pre-trigger exacto
-                    // Las ultimas 22 muestras del buffer son el golpe (posiciones 91..112)
-                    // Activar post-trigger — sensor_task empieza a llenar g_post_buf
-                    g_buffer_frozen = true;
-                    g_post_count    = 0;
-                    g_post_active   = true;
+                    xSemaphoreTake(g_trigger_mutex, portMAX_DELAY);
+                    if (g_status != NODE_STATUS_IDLE) {
+                        xSemaphoreGive(g_trigger_mutex);
+                    } else {
+                        g_status = NODE_STATUS_RECORDING;
+                        xSemaphoreGive(g_trigger_mutex);
+                        g_trigger_slot   = g_current_slot;
+                        g_trigger_source = TRIGGER_SOURCE_AUTO;
+                        g_trigger_ts     = now_ms();
+                        g_trigger_head   = g_buffer.head;
+    
+                        // Congelar el buffer circular — preserva el pre-trigger exacto
+                        // Las ultimas 22 muestras del buffer son el golpe (posiciones 91..112)
+                        // Activar post-trigger — sensor_task empieza a llenar g_post_buf
+                        g_buffer_frozen = true;
+                        g_post_count    = 0;
+                        g_post_active   = true;
+                    }
 
                     xEventGroupSetBits(g_eventos, EVT_VIBRACION);              //Activa el bit de tx_task
                     espnow_send_trigger(ESPNOW_BROADCAST_MAC, g_trigger_slot,  //Mando el broadcast
@@ -832,8 +951,19 @@ static void tx_task(void *pv)
         measurement_config_t cfg = g_config;
         xSemaphoreGive(g_config_mutex);
 
-        uint16_t pre  = ms_to_samples(cfg.pre_trigger_ms,  SENSOR_SAMPLE_RATE_HZ);
-        uint16_t post = ms_to_samples(cfg.post_trigger_ms, SENSOR_SAMPLE_RATE_HZ);
+        uint16_t pre  = 0;
+        uint16_t post = 0;
+        uint16_t post_ms = 0;
+        
+        if (g_trigger_source == TRIGGER_SOURCE_MANUAL){
+            pre = 0;
+            post = ms_to_samples(cfg.manual_duration_ms, SENSOR_SAMPLE_RATE_HZ);
+            post_ms = cfg.manual_duration_ms;
+        } else {
+            pre  = ms_to_samples(cfg.pre_trigger_ms,  SENSOR_SAMPLE_RATE_HZ);
+            post = ms_to_samples(cfg.post_trigger_ms, SENSOR_SAMPLE_RATE_HZ);
+            post_ms = cfg.post_trigger_ms;
+        }
 
         icm20948_raw_sample_t chunk[STREAM_CHUNK_SAMPLES];
 
@@ -898,8 +1028,13 @@ static void tx_task(void *pv)
             m->slot_index     = g_trigger_slot;
             m->trigger_source = g_trigger_source;
             m->timestamp_ms   = g_trigger_ts;
-            m->pre_trigger_ms = cfg.pre_trigger_ms;
-            m->post_trigger_ms= cfg.post_trigger_ms;
+            if (g_trigger_source == TRIGGER_SOURCE_MANUAL) {
+                m->pre_trigger_ms  = 0;
+                m->post_trigger_ms = cfg.manual_duration_ms;
+            } else {
+                m->pre_trigger_ms  = cfg.pre_trigger_ms;
+                m->post_trigger_ms = cfg.post_trigger_ms;
+            }
             m->threshold_g    = cfg.threshold_g;
             m->acel_range     = 1;
             m->sample_rate_hz = SENSOR_SAMPLE_RATE_HZ;
@@ -911,7 +1046,7 @@ static void tx_task(void *pv)
 
             uint16_t pre_got = circ_buffer_pop(&g_buffer, samples_ptr, pre);
 
-            uint32_t deadline = now_ms() + cfg.post_trigger_ms + 200;
+            uint32_t deadline = now_ms() + post_ms + 200;
             while (g_post_count < post) {
                 if (xEventGroupGetBits(g_eventos) & EVT_STOP) {
                     xEventGroupClearBits(g_eventos, EVT_STOP);
@@ -986,7 +1121,7 @@ static void heartbeat_task(void *pv)
         vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS));                        //Espera HEARTBEAT_INTERVAL_MS
         if (g_role != NODE_ROLE_MASTER) continue;                                //Si no es master, no envia heartbeat
 
-        espnow_send_heartbeat(ESPNOW_BROADCAST_MAC, now_ms());                   //Manda heartbeat a todos los nodos
+        espnow_send_heartbeat(ESPNOW_BROADCAST_MAC, now_ms(), g_current_slot);                   //Manda heartbeat a todos los nodos
 
         xSemaphoreTake(g_nodes_mutex, portMAX_DELAY);
         for (int i = 0; i < g_node_count; i++) {
@@ -1023,6 +1158,7 @@ static void button_task(void *pv)
                     .on_stop       = on_wifi_stop,
                     .on_get_status = on_wifi_get_status,
                     .on_set_config = on_wifi_set_config,
+                    .on_get_config = on_wifi_get_config,
                     .on_sync_start = on_wifi_sync_start,
                     .on_sync_stop  = on_wifi_sync_stop,
                     .on_stream_start     = on_wifi_stream_start,
@@ -1094,7 +1230,7 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
-
+    config_load();
     // 2. Event loop
     ESP_ERROR_CHECK(esp_event_loop_create_default());//ni idea - WiFi necesita un sistema de eventos para notificar conexiones, desconexiones, etc. Tiene que crearse antes que el WiFi.
             
@@ -1130,6 +1266,7 @@ void app_main(void)
     g_config_mutex = xSemaphoreCreateMutex();
     g_nodes_mutex  = xSemaphoreCreateMutex();
     g_slots_mutex  = xSemaphoreCreateMutex();
+    g_trigger_mutex = xSemaphoreCreateMutex();
     g_eventos      = xEventGroupCreate();
 
     // 6. WiFi base — ambos nodos lo necesitan para ESP-NOW
@@ -1149,6 +1286,7 @@ void app_main(void)
             .on_start      = on_wifi_start,
             .on_stop       = on_wifi_stop,
             .on_get_status = on_wifi_get_status,
+            .on_get_config = on_wifi_get_config,
             .on_set_config = on_wifi_set_config,
             .on_sync_start = on_wifi_sync_start,
             .on_sync_stop  = on_wifi_sync_stop,

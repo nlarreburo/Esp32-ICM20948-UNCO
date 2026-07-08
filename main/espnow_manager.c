@@ -396,11 +396,12 @@ esp_err_t espnow_send_config_ack(const uint8_t dst_mac[6], uint8_t ok)
     return espnow_send_raw(dst_mac, &msg, sizeof(msg));
 }
 
-esp_err_t espnow_send_heartbeat(const uint8_t dst_mac[6], uint32_t timestamp_ms)
+esp_err_t espnow_send_heartbeat(const uint8_t dst_mac[6], uint32_t timestamp_ms, uint8_t current_slot)
 {
     msg_heartbeat_t msg = {
         .header       = { .msg_type = MSG_HEARTBEAT },
         .timestamp_ms = timestamp_ms,
+        .current_slot = current_slot,
     };
     return espnow_send_raw(dst_mac, &msg, sizeof(msg));
 }

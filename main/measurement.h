@@ -122,6 +122,7 @@ typedef struct {
     uint32_t      last_seen_ms;     // timestamp del ultimo heartbeat recibido
                                     // si (now - last_seen_ms) > 15000 → nodo offline
     uint8_t       current_slot;     // slot activo actualmente en ese nodo
+    uint8_t       config_sync;      //1 o 0 para saber si esta sincronizada la configuracion
 } node_state_t;
 
 
